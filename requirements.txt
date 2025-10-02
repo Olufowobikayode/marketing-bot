@@ -1,0 +1,14 @@
+# =============================================
+# Email Marketing Bot - Core Dependencies
+# =============================================
+
+# ========= CORE DEPENDENCIES =========
+python-dotenv==1.0.0
+requests==2.31.0
+pandas==2.1.3
+openpyxl==3.1.2
+email-validator==2.1.0
+python-telegram-bot==20.7
+google-generativeai==0.3.2
+aiohttp==3.9.1
+pydantic==2.5.0
