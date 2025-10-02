@@ -44,6 +44,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+# ========= DATABASE HEALTH CHECK =========
+def check_database_health():
+    """Check health of all database modules on startup."""
+    logger.info("🔍 Checking database health...")
+    
+    modules_health = {
+        "contacts": contacts.health_check(),
+        "templates": templates.health_check(),
+        "campaigns": campaigns.health_check(),
+        "providers": providers.health_check()
+    }
+    
+    all_healthy = True
+    for module_name, health in modules_health.items():
+        status = health.get('status', 'unknown')
+        if status != 'healthy':
+            all_healthy = False
+            logger.warning("❌ %s module: %s", module_name, health.get('error', 'Unknown issue'))
+        else:
+            logger.info("✅ %s module: healthy", module_name)
+    
+    return all_healthy
+
 # ========= BOT COMMANDS =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Welcome message with available commands."""
@@ -427,11 +450,11 @@ async def list_providers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         for provider in provider_list:
             status = "🟢" if provider["enabled"] else "🔴"
-            success_rate = provider["success_rate"] * 100
+            success_rate = provider["success_rate"]
             usage = f"{provider['used_today']}/{provider['daily_limit']}"
             
             message += (
-                f"{status} **{provider['name']}** ({provider['type']})\n"
+                f"{status} **{provider['name']}** ({provider['provider_type']})\n"
                 f"   Priority: {provider['priority']} | Today: {usage}\n"
                 f"   Success: {success_rate:.1f}% | Total: {provider['success_count']} sent\n"
                 f"   Status: {'Enabled' if provider['enabled'] else 'Disabled'}\n\n"
@@ -766,8 +789,7 @@ async def system_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_message = "🖥️ **System Status**\n\n"
         
         # Templates status
-        from templates import health_check as templates_health
-        templates_status = templates_health()
+        templates_status = templates.health_check()
         status_message += f"📧 Templates: {templates_status['status'].upper()}\n"
         status_message += f"   Count: {templates_status['templates_count']}\n"
         status_message += f"   MJML: {'✅' if templates_status['mjml_configured'] else '❌'}\n\n"
@@ -824,6 +846,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Start the bot."""
     try:
+        # Check database health before starting
+        if not check_database_health():
+            logger.warning("Some database modules are not healthy, but continuing...")
+        
         app = ApplicationBuilder().token(BOT_TOKEN).build()
 
         # ========= REGISTER COMMAND HANDLERS =========
