@@ -12,14 +12,8 @@ from telegram.ext import (
 )
 
 # Import local modules with explicit imports to avoid conflicts
-from templates import (
-    save_new_template,
-    get_template_html,
-    ai_generate_template,
-    ai_copywrite as templates_ai_copywrite,
-    preview_template_to_file,
-    get_template_meta
-)
+# Import local modules with explicit imports to avoid conflicts
+import templates
 import contacts
 import campaigns
 import providers
