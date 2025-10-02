@@ -9,19 +9,24 @@ import time
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 from urllib.parse import urljoin
+from bson import ObjectId
+import pymongo
+from pymongo import MongoClient, UpdateOne
+from pymongo.errors import PyMongoError, DuplicateKeyError
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
 # ========= CONFIG =========
 try:
-    from config import TEMPLATE_DIR, TEMPLATE_DB, MJML_APP_ID, MJML_SECRET, DATA_DIR
+    from config import TEMPLATE_DIR, MONGODB_URI, MONGODB_DB_NAME, MJML_APP_ID, MJML_SECRET, DATA_DIR
 except Exception:
     from dotenv import load_dotenv
 
     load_dotenv()
     TEMPLATE_DIR = os.getenv("TEMPLATE_DIR", "templates")
-    TEMPLATE_DB = os.getenv("TEMPLATE_DB", os.path.join("data", "templates.json"))
+    MONGODB_URI = os.getenv("MONGODB_URI")
+    MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "marketing_bot")
     MJML_APP_ID = os.getenv("MJML_APP_ID")
     MJML_SECRET = os.getenv("MJML_SECRET")
     DATA_DIR = os.getenv("DATA_DIR", "data")
@@ -37,6 +42,54 @@ if not logger.handlers:
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     logger.addHandler(h)
 logger.setLevel(logging.INFO)
+
+# ========= MONGODB CONNECTION MANAGEMENT =========
+class MongoDBManager:
+    _client = None
+    _db = None
+    
+    @classmethod
+    def get_client(cls):
+        if cls._client is None:
+            try:
+                cls._client = MongoClient(
+                    MONGODB_URI,
+                    maxPoolSize=50,
+                    connectTimeoutMS=30000,
+                    socketTimeoutMS=30000,
+                    retryWrites=True
+                )
+                # Test connection
+                cls._client.admin.command('ping')
+                logger.info("MongoDB connection established successfully")
+            except Exception as e:
+                logger.error("Failed to connect to MongoDB: %s", e)
+                raise
+        return cls._client
+    
+    @classmethod
+    def get_db(cls):
+        if cls._db is None:
+            client = cls.get_client()
+            cls._db = client[MONGODB_DB_NAME]
+        return cls._db
+    
+    @classmethod
+    def get_templates_collection(cls):
+        db = cls.get_db()
+        return db.templates
+    
+    @classmethod
+    def close_connection(cls):
+        if cls._client:
+            cls._client.close()
+            cls._client = None
+            cls._db = None
+            logger.info("MongoDB connection closed")
+
+def get_templates_collection():
+    """Get the templates collection with error handling."""
+    return MongoDBManager.get_templates_collection()
 
 # ========= HTTP SESSION =========
 def _build_robust_session() -> requests.Session:
@@ -66,71 +119,8 @@ CACHE_TTL = 300  # 5 minutes cache for rendered HTML
 def _now_iso() -> str:
     return datetime.utcnow().isoformat()
 
-def _atomic_write_json(path: str, data: Dict):
-    """Write JSON atomically to avoid corruption."""
-    dirn = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".tmp_templates_", suffix=".json")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        logger.debug("Atomically wrote JSON to %s", path)
-    except Exception as e:
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
-        logger.error("Atomic write failed for %s: %s", path, e)
-        raise
-
-def _load_json_safe(path: str) -> Dict:
-    """Safely load JSON with comprehensive error handling."""
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        try:
-            if not os.path.exists(path):
-                logger.warning("JSON file %s does not exist, returning empty dict", path)
-                return {}
-                
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                
-            if not isinstance(data, dict):
-                logger.warning("JSON file %s does not contain a dict, returning empty", path)
-                return {}
-                
-            return data
-            
-        except json.JSONDecodeError as e:
-            logger.error("JSON decode error in %s (attempt %d): %s", path, attempt + 1, e)
-            if attempt < max_attempts - 1:
-                # Try to backup corrupted file and create new one
-                backup_path = f"{path}.corrupted.{int(time.time())}"
-                try:
-                    os.rename(path, backup_path)
-                    logger.warning("Backed up corrupted file to %s", backup_path)
-                except Exception:
-                    pass
-                # Create empty DB
-                _atomic_write_json(path, {})
-                time.sleep(0.5)
-            else:
-                logger.error("Failed to load JSON after %d attempts, returning empty dict", max_attempts)
-                return {}
-                
-        except Exception as e:
-            logger.error("Unexpected error loading JSON %s: %s", path, e)
-            if attempt < max_attempts - 1:
-                time.sleep(0.5)
-            else:
-                return {}
-    
-    return {}
-
 def _sanitize_key(name: str) -> str:
-    """Sanitize template key for use in JSON metadata map."""
+    """Sanitize template key for use in MongoDB."""
     if not name or not isinstance(name, str):
         raise ValueError("Template name must be a non-empty string")
         
@@ -253,22 +243,23 @@ def render_mjml(mjml_code: str, timeout: int = 30, max_retries: int = 2) -> Opti
     return None
 
 # ========= DATABASE OPERATIONS =========
-def load_templates() -> Dict[str, Dict]:
-    """
-    Returns the templates metadata map with caching.
-    """
-    return _load_json_safe(TEMPLATE_DB)
-
-def save_templates(data: Dict[str, Dict]):
-    """Save templates metadata with validation."""
-    if not isinstance(data, dict):
-        raise ValueError("Templates data must be a dictionary")
+def init_db():
+    """Initialize MongoDB indexes for templates with robust error handling."""
+    try:
+        collection = get_templates_collection()
         
-    for key, value in data.items():
-        if not isinstance(value, dict):
-            raise ValueError(f"Template metadata for key '{key}' must be a dictionary")
-            
-    _atomic_write_json(TEMPLATE_DB, data)
+        # Create indexes for performance
+        collection.create_index([("key", pymongo.ASCENDING)], unique=True, name="idx_templates_key")
+        collection.create_index([("name", pymongo.ASCENDING)], name="idx_templates_name")
+        collection.create_index([("source", pymongo.ASCENDING)], name="idx_templates_source")
+        collection.create_index([("tags", pymongo.ASCENDING)], name="idx_templates_tags")
+        collection.create_index([("created_at", pymongo.DESCENDING)], name="idx_templates_created")
+        
+        logger.info("MongoDB indexes initialized successfully")
+        
+    except Exception as e:
+        logger.error("Failed to initialize MongoDB indexes: %s", e)
+        raise
 
 # ========= TEMPLATE CRUD OPERATIONS =========
 def save_new_template(
@@ -352,19 +343,23 @@ def save_new_template(
     }
     
     # Update database
-    db = load_templates()
+    collection = get_templates_collection()
     
     # Ensure unique key
     final_key = key
-    if key in db:
-        counter = 1
-        while f"{key}_{counter}" in db:
+    counter = 1
+    while True:
+        try:
+            # Try to insert with current key
+            result = collection.insert_one(meta)
+            break
+        except DuplicateKeyError:
+            # Key exists, try with counter suffix
+            final_key = f"{key}_{counter}"
+            meta["key"] = final_key
             counter += 1
-        final_key = f"{key}_{counter}"
-        logger.info("Template key '%s' existed, using '%s' instead", key, final_key)
-    
-    db[final_key] = meta
-    save_templates(db)
+            if counter > 100:  # Safety limit
+                raise ValueError("Too many duplicate keys, please choose a different template name")
     
     logger.info("Saved template '%s' as key='%s' file=%s", name, final_key, filename)
     return filename
@@ -377,21 +372,29 @@ def get_template_meta(key_or_name: str) -> Optional[Tuple[str, Dict]]:
     if not key_or_name:
         return None
         
-    db = load_templates()
+    collection = get_templates_collection()
     
     # Direct key match
-    if key_or_name in db:
-        return key_or_name, db[key_or_name]
+    template = collection.find_one({"key": key_or_name})
+    if template:
+        # Convert ObjectId to string for consistency
+        template_dict = dict(template)
+        template_dict["_id"] = str(template_dict["_id"])
+        return key_or_name, template_dict
     
     # Exact name match (case-insensitive)
-    for key, meta in db.items():
-        if meta.get("name", "").lower() == key_or_name.lower():
-            return key, meta
+    template = collection.find_one({"name": {"$regex": f"^{key_or_name}$", "$options": "i"}})
+    if template:
+        template_dict = dict(template)
+        template_dict["_id"] = str(template_dict["_id"])
+        return template_dict["key"], template_dict
     
     # Fuzzy name match (contains)
-    for key, meta in db.items():
-        if key_or_name.lower() in meta.get("name", "").lower():
-            return key, meta
+    template = collection.find_one({"name": {"$regex": key_or_name, "$options": "i"}})
+    if template:
+        template_dict = dict(template)
+        template_dict["_id"] = str(template_dict["_id"])
+        return template_dict["key"], template_dict
     
     logger.debug("Template not found: %s", key_or_name)
     return None
@@ -421,10 +424,10 @@ def delete_template(key_or_name: str) -> bool:
         logger.error("Failed to delete template file for %s: %s", key, e)
     
     # Update database
-    db = load_templates()
-    if key in db:
-        db.pop(key)
-        save_templates(db)
+    collection = get_templates_collection()
+    result = collection.delete_one({"key": key})
+    
+    if result.deleted_count > 0:
         logger.info("Deleted template %s (file deleted: %s)", key, file_deleted)
         return True
     
@@ -440,39 +443,33 @@ def list_templates(
     """
     Return list of template metadata with filtering and pagination.
     """
-    db = load_templates()
-    items = list(db.values())
+    collection = get_templates_collection()
     
-    # Apply filters
+    # Build query
+    query = {}
     if keyword:
-        keyword_lower = keyword.lower()
-        items = [
-            m for m in items 
-            if (keyword_lower in m.get("name", "").lower() or 
-                keyword_lower in m.get("description", "").lower() or
-                any(keyword_lower in tag.lower() for tag in m.get("tags", [])))
+        query["$or"] = [
+            {"name": {"$regex": keyword, "$options": "i"}},
+            {"description": {"$regex": keyword, "$options": "i"}},
+            {"tags": {"$in": [tag for tag in tags or [] if keyword.lower() in tag.lower()]}} if tags else {}
         ]
     
     if tags:
-        tags_lower = {t.lower() for t in tags}
-        items = [
-            m for m in items 
-            if tags_lower.issubset({t.lower() for t in m.get("tags", [])})
-        ]
+        query["tags"] = {"$all": tags}
     
     if source:
-        items = [m for m in items if m.get("source") == source]
+        query["source"] = source
     
-    # Sort by created_at descending
-    items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    # Execute query with pagination
+    cursor = collection.find(
+        query,
+        projection={"_id": 0}  # Exclude MongoDB _id from results
+    ).sort("created_at", pymongo.DESCENDING).skip(offset).limit(limit)
     
-    # Apply pagination
-    start_idx = offset
-    end_idx = offset + limit
-    result = items[start_idx:end_idx]
+    templates = list(cursor)
     
-    logger.debug("List templates: %d results (filtered from %d)", len(result), len(items))
-    return result
+    logger.debug("List templates: %d results", len(templates))
+    return templates
 
 def get_template_html(key_or_name: str, force_refresh: bool = False) -> Optional[str]:
     """
@@ -515,15 +512,18 @@ def get_template_html(key_or_name: str, force_refresh: bool = False) -> Optional
         
         # Update cache in database
         if html:
-            meta["html_cached"] = html
-            meta["html_cached_at"] = _now_iso()
-            meta["updated_at"] = _now_iso()
-            
-            db = load_templates()
-            if key in db:
-                db[key] = meta
-                save_templates(db)
-                logger.debug("Updated HTML cache for %s", key)
+            collection = get_templates_collection()
+            collection.update_one(
+                {"key": key},
+                {
+                    "$set": {
+                        "html_cached": html,
+                        "html_cached_at": _now_iso(),
+                        "updated_at": _now_iso()
+                    }
+                }
+            )
+            logger.debug("Updated HTML cache for %s", key)
         
         return html
         
@@ -562,6 +562,54 @@ def preview_template_to_file(
         logger.exception("Failed to write preview file %s: %s", out_path, e)
         return None
 
+# ========= AI TEMPLATE GENERATION =========
+def ai_generate_template(title: str, brief: str) -> Optional[str]:
+    """
+    Generate a template using AI and save it.
+    Returns the template key if successful.
+    """
+    try:
+        from ai import generate_template as ai_generate
+        
+        # Generate MJML using AI
+        mjml_content = ai_generate(title, brief)
+        if not mjml_content:
+            logger.error("AI template generation failed for: %s", title)
+            return None
+        
+        # Save the template
+        filename = save_new_template(
+            name=title,
+            content=mjml_content,
+            is_html=False,
+            tags=["ai-generated"],
+            description=brief,
+            source="ai"
+        )
+        
+        # Get the final key that was saved
+        template_meta = get_template_meta(title)
+        if template_meta:
+            return template_meta[0]  # Return the key
+        
+        return None
+        
+    except Exception as e:
+        logger.error("Error in AI template generation: %s", e)
+        return None
+
+def ai_copywrite(prompt: str) -> Dict[str, str]:
+    """
+    Generate marketing copy using AI.
+    """
+    try:
+        from ai import ai_copywrite as ai_copy
+        
+        return ai_copy(prompt)
+    except Exception as e:
+        logger.error("Error in AI copywriting: %s", e)
+        return {"subject": "AI Copy Error", "body": "Failed to generate copy."}
+
 # ========= HEALTH CHECK =========
 def health_check() -> Dict[str, Any]:
     """
@@ -574,6 +622,7 @@ def health_check() -> Dict[str, Any]:
         "templates_count": 0,
         "mjml_configured": bool(MJML_APP_ID and MJML_SECRET),
         "storage_accessible": False,
+        "mongodb_accessible": False,
         "timestamp": _now_iso()
     }
     
@@ -585,11 +634,21 @@ def health_check() -> Dict[str, Any]:
             status["status"] = "error"
             status["error"] = "Template storage not accessible"
             return status
-            
-        # Count templates
-        db = load_templates()
-        status["templates_count"] = len(db)
         
+        # Check MongoDB connection
+        try:
+            collection = get_templates_collection()
+            collection.database.command('ping')
+            status["mongodb_accessible"] = True
+            
+            # Count templates
+            status["templates_count"] = collection.count_documents({})
+            
+        except Exception as e:
+            status["mongodb_accessible"] = False
+            status["error"] = f"MongoDB connection failed: {str(e)}"
+            return status
+            
         # Test MJML rendering if configured
         if status["mjml_configured"]:
             test_mjml = "<mjml><mj-body><mj-section><mj-column><mj-text>Test</mj-text></mj-column></mj-section></mj-body></mjml>"
@@ -615,18 +674,12 @@ def health_check() -> Dict[str, Any]:
 def _initialize_module():
     """Initialize templates module on import."""
     try:
-        # Ensure template DB exists
-        if not os.path.exists(TEMPLATE_DB):
-            save_templates({})
-            logger.info("Initialized templates database at %s", TEMPLATE_DB)
-        
-        # Health check on startup
+        init_db()
         health = health_check()
         if health["status"] == "healthy":
             logger.info("Templates module initialized: %d templates", health["templates_count"])
         else:
             logger.warning("Templates module initialized with issues: %s", health.get("error", "Unknown"))
-            
     except Exception as e:
         logger.error("Failed to initialize templates module: %s", e)
 
@@ -644,6 +697,7 @@ if __name__ == "__main__":
     print(f"Templates Count: {health['templates_count']}")
     print(f"MJML Configured: {health['mjml_configured']}")
     print(f"Storage Accessible: {health['storage_accessible']}")
+    print(f"MongoDB Accessible: {health['mongodb_accessible']}")
     
     if health["status"] in ["healthy", "degraded"]:
         # List existing templates
