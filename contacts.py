@@ -3,21 +3,25 @@ import os
 import re
 import csv
 import json
-import sqlite3
 import logging
 import pandas as pd
 from typing import List, Dict, Tuple, Optional, Any
 from email_validator import validate_email, EmailNotValidError
-from contextlib import contextmanager
+from datetime import datetime
+from bson import ObjectId
+import pymongo
+from pymongo import MongoClient, UpdateOne
+from pymongo.errors import PyMongoError, DuplicateKeyError
 
 # ========= CONFIG =========
 try:
-    from config import CONTACTS_DB, DATA_DIR
+    from config import MONGODB_URI, MONGODB_DB_NAME, DATA_DIR
 except ImportError:
     from dotenv import load_dotenv
     load_dotenv()
+    MONGODB_URI = os.getenv("MONGODB_URI")
+    MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "marketing_bot")
     DATA_DIR = os.getenv("DATA_DIR", "data")
-    CONTACTS_DB = os.getenv("CONTACTS_DB", os.path.join(DATA_DIR, "contacts.db"))
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -29,69 +33,78 @@ if not logger.handlers:
     logger.addHandler(h)
 logger.setLevel(logging.INFO)
 
-# ========= DATABASE CONNECTION MANAGEMENT =========
-@contextmanager
-def get_db_connection():
-    """Context manager for database connections with connection pooling."""
-    conn = None
-    try:
-        conn = sqlite3.connect(
-            CONTACTS_DB,
-            timeout=30,
-            check_same_thread=False  # Allow multiple threads
-        )
-        conn.row_factory = sqlite3.Row  # Return dict-like rows
-        # Enable foreign keys and WAL mode for better performance
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        yield conn
-    except Exception as e:
-        logger.error("Database connection error: %s", e)
-        raise
-    finally:
-        if conn:
-            conn.close()
+# ========= MONGODB CONNECTION MANAGEMENT =========
+class MongoDBManager:
+    _client = None
+    _db = None
+    
+    @classmethod
+    def get_client(cls):
+        if cls._client is None:
+            try:
+                cls._client = MongoClient(
+                    MONGODB_URI,
+                    maxPoolSize=50,
+                    connectTimeoutMS=30000,
+                    socketTimeoutMS=30000,
+                    retryWrites=True
+                )
+                # Test connection
+                cls._client.admin.command('ping')
+                logger.info("MongoDB connection established successfully")
+            except Exception as e:
+                logger.error("Failed to connect to MongoDB: %s", e)
+                raise
+        return cls._client
+    
+    @classmethod
+    def get_db(cls):
+        if cls._db is None:
+            client = cls.get_client()
+            cls._db = client[MONGODB_DB_NAME]
+        return cls._db
+    
+    @classmethod
+    def get_contacts_collection(cls):
+        db = cls.get_db()
+        return db.contacts
+    
+    @classmethod
+    def close_connection(cls):
+        if cls._client:
+            cls._client.close()
+            cls._client = None
+            cls._db = None
+            logger.info("MongoDB connection closed")
+
+def get_contacts_collection():
+    """Get the contacts collection with error handling."""
+    return MongoDBManager.get_contacts_collection()
 
 def init_db():
-    """Initialize SQLite DB for contacts with robust error handling."""
+    """Initialize MongoDB indexes for contacts with robust error handling."""
     try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            
-            # Create contacts table
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS contacts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                group_name TEXT NOT NULL,
-                name TEXT,
-                email TEXT NOT NULL,
-                valid INTEGER DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(email, group_name)
-            )
-            """)
-            
-            # Create indexes for performance
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_contacts_group ON contacts(group_name)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_contacts_email ON contacts(email)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_contacts_valid ON contacts(valid)")
-            
-            # Create trigger for updated_at
-            cur.execute("""
-            CREATE TRIGGER IF NOT EXISTS update_contacts_timestamp 
-            AFTER UPDATE ON contacts
-            FOR EACH ROW
-            BEGIN
-                UPDATE contacts SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-            END
-            """)
-            
-            conn.commit()
-            logger.info("Database initialized successfully")
-            
+        collection = get_contacts_collection()
+        
+        # Create indexes for performance
+        collection.create_index([("group_name", pymongo.ASCENDING)], name="idx_contacts_group")
+        collection.create_index([("email", pymongo.ASCENDING)], name="idx_contacts_email")
+        collection.create_index([("valid", pymongo.ASCENDING)], name="idx_contacts_valid")
+        
+        # Create unique compound index for email+group_name constraint
+        collection.create_index(
+            [("email", pymongo.ASCENDING), ("group_name", pymongo.ASCENDING)],
+            unique=True,
+            name="idx_contacts_email_group_unique"
+        )
+        
+        # Create TTL index for automatic cleanup if needed (optional)
+        # collection.create_index([("created_at", pymongo.ASCENDING)], expireAfterSeconds=3600)
+        
+        logger.info("MongoDB indexes initialized successfully")
+        
     except Exception as e:
-        logger.error("Failed to initialize database: %s", e)
+        logger.error("Failed to initialize MongoDB indexes: %s", e)
         raise
 
 # ========= VALIDATION =========
@@ -193,64 +206,76 @@ def save_contacts_from_file(file_path: str, group_name: str) -> Tuple[int, int, 
         raise ValueError(f"Failed to parse file: {str(e)}")
 
     saved, invalid = 0, 0
+    bulk_operations = []
     
     try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            
-            for row_num, row in enumerate(rows, 1):
-                try:
-                    email, name = None, None
+        collection = get_contacts_collection()
+        
+        for row_num, row in enumerate(rows, 1):
+            try:
+                email, name = None, None
 
-                    # Extract email and name from row cells
-                    for cell in row:
-                        if pd.isna(cell):
-                            continue
-                        cell_str = str(cell).strip()
-                        if not cell_str:
-                            continue
-                            
-                        if "@" in cell_str and not email:
-                            # Basic email format check
-                            if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', cell_str):
-                                email = cell_str
-                        elif not name and cell_str:
-                            name = cell_str[:100]  # Limit name length
-
-                    if not email:
-                        invalid += 1
-                        error_messages.append(f"Row {row_num}: No valid email found")
+                # Extract email and name from row cells
+                for cell in row:
+                    if pd.isna(cell):
                         continue
+                    cell_str = str(cell).strip()
+                    if not cell_str:
+                        continue
+                        
+                    if "@" in cell_str and not email:
+                        # Basic email format check
+                        if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', cell_str):
+                            email = cell_str
+                    elif not name and cell_str:
+                        name = cell_str[:100]  # Limit name length
 
-                    # Validate email
-                    is_valid = validate_email_address(email)
-                    
-                    try:
-                        cur.execute(
-                            """INSERT OR IGNORE INTO contacts 
-                               (group_name, name, email, valid) 
-                               VALUES (?, ?, ?, ?)""",
-                            (group_name, name, email, 1 if is_valid else 0),
-                        )
-                        
-                        if cur.rowcount > 0:  # Row was inserted
-                            saved += 1 if is_valid else 0
-                            invalid += 0 if is_valid else 1
-                        # else: duplicate email in same group (ignored)
-                        
-                    except sqlite3.Error as e:
-                        error_messages.append(f"Row {row_num}: Database error - {str(e)}")
-                        invalid += 1
-                        
-                except Exception as e:
-                    error_messages.append(f"Row {row_num}: Processing error - {str(e)}")
+                if not email:
                     invalid += 1
+                    error_messages.append(f"Row {row_num}: No valid email found")
                     continue
 
-            conn.commit()
+                # Validate email
+                is_valid = validate_email_address(email)
+                
+                # Prepare contact document
+                contact_doc = {
+                    "group_name": group_name,
+                    "name": name,
+                    "email": email,
+                    "valid": is_valid,
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow()
+                }
+                
+                # Create upsert operation
+                bulk_operations.append(
+                    UpdateOne(
+                        {"email": email, "group_name": group_name},
+                        {"$setOnInsert": contact_doc},
+                        upsert=True
+                    )
+                )
+                
+            except Exception as e:
+                error_messages.append(f"Row {row_num}: Processing error - {str(e)}")
+                invalid += 1
+                continue
+
+        # Execute bulk operations
+        if bulk_operations:
+            result = collection.bulk_write(bulk_operations, ordered=False)
+            saved = result.upserted_count
+            # Note: MongoDB doesn't tell us about duplicates in bulk operations
+            # We'll estimate duplicates as total rows - saved - invalid
+            estimated_duplicates = len(rows) - saved - invalid
+            logger.debug("Estimated duplicates: %d", estimated_duplicates)
             
+    except PyMongoError as e:
+        logger.error("MongoDB error during contact import: %s", e)
+        raise
     except Exception as e:
-        logger.error("Database error during contact import: %s", e)
+        logger.error("Unexpected error during contact import: %s", e)
         raise
         
     logger.info(
@@ -274,34 +299,27 @@ def list_contacts(
     offset = max(0, offset)
     
     try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
+        collection = get_contacts_collection()
+        
+        query = {"group_name": group_name}
+        if only_valid:
+            query["valid"] = True
             
-            query = """
-                SELECT id, name, email, valid, created_at 
-                FROM contacts 
-                WHERE group_name = ?
-            """
-            params = [group_name]
+        cursor = collection.find(
+            query,
+            projection={"_id": 0, "id": {"$toString": "$_id"}, "name": 1, "email": 1, "valid": 1, "created_at": 1}
+        ).sort("_id", pymongo.ASCENDING).skip(offset).limit(limit)
+        
+        contacts = []
+        for doc in cursor:
+            # Convert ObjectId to string for JSON serialization
+            doc["id"] = str(doc["_id"])
+            del doc["_id"]
+            contacts.append(doc)
             
-            if only_valid:
-                query += " AND valid = 1"
-                
-            query += " ORDER BY id LIMIT ? OFFSET ?"
-            params.extend([limit, offset])
+        return contacts
             
-            cur.execute(query, params)
-            rows = cur.fetchall()
-            
-            return [{
-                "id": r[0],
-                "name": r[1],
-                "email": r[2],
-                "valid": bool(r[3]),
-                "created_at": r[4]
-            } for r in rows]
-            
-    except Exception as e:
+    except PyMongoError as e:
         logger.error("Error listing contacts for group %s: %s", group_name, e)
         raise
 
@@ -309,12 +327,10 @@ def list_contacts(
 def list_groups() -> List[str]:
     """List all contact groups with error handling."""
     try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT DISTINCT group_name FROM contacts ORDER BY group_name")
-            rows = cur.fetchall()
-            return [r[0] for r in rows]
-    except Exception as e:
+        collection = get_contacts_collection()
+        groups = collection.distinct("group_name")
+        return sorted(groups)
+    except PyMongoError as e:
         logger.error("Error listing groups: %s", e)
         return []
 
@@ -324,11 +340,9 @@ def count_group_contacts(group_name: str) -> int:
         return 0
         
     try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM contacts WHERE group_name = ?", (group_name,))
-            return cur.fetchone()[0] or 0
-    except Exception as e:
+        collection = get_contacts_collection()
+        return collection.count_documents({"group_name": group_name})
+    except PyMongoError as e:
         logger.error("Error counting contacts for group %s: %s", group_name, e)
         return 0
 
@@ -338,36 +352,37 @@ def group_stats(group_name: str) -> Dict[str, Any]:
         return {"error": "Invalid group name"}
         
     try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT 
-                    COUNT(*) as total,
-                    SUM(valid) as valid_count,
-                    COUNT(*) - SUM(valid) as invalid_count,
-                    MIN(created_at) as oldest_contact,
-                    MAX(created_at) as newest_contact
-                FROM contacts 
-                WHERE group_name = ?
-            """, (group_name,))
+        collection = get_contacts_collection()
+        
+        pipeline = [
+            {"$match": {"group_name": group_name}},
+            {"$group": {
+                "_id": "$group_name",
+                "total": {"$sum": 1},
+                "valid_count": {"$sum": {"$cond": ["$valid", 1, 0]}},
+                "invalid_count": {"$sum": {"$cond": ["$valid", 0, 1]}},
+                "oldest_contact": {"$min": "$created_at"},
+                "newest_contact": {"$max": "$created_at"}
+            }}
+        ]
+        
+        result = list(collection.aggregate(pipeline))
+        if not result:
+            return {"error": "Group not found"}
             
-            result = cur.fetchone()
-            if not result:
-                return {"error": "Group not found"}
-                
-            total, valid, invalid, oldest, newest = result
-            
-            return {
-                "group_name": group_name,
-                "total": total or 0,
-                "valid": valid or 0,
-                "invalid": invalid or 0,
-                "oldest_contact": oldest,
-                "newest_contact": newest,
-                "valid_percentage": (valid / total * 100) if total > 0 else 0
-            }
-            
-    except Exception as e:
+        stats = result[0]
+        
+        return {
+            "group_name": group_name,
+            "total": stats["total"],
+            "valid": stats["valid_count"],
+            "invalid": stats["invalid_count"],
+            "oldest_contact": stats["oldest_contact"],
+            "newest_contact": stats["newest_contact"],
+            "valid_percentage": (stats["valid_count"] / stats["total"] * 100) if stats["total"] > 0 else 0
+        }
+        
+    except PyMongoError as e:
         logger.error("Error getting stats for group %s: %s", group_name, e)
         return {"error": str(e)}
 
@@ -398,59 +413,48 @@ def filter_contacts(
     created_count = 0
     
     try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
+        collection = get_contacts_collection()
+        
+        # Build query
+        query = {}
+        if source_group:
+            query["group_name"] = source_group
+        if domain:
+            query["email"] = {"$regex": f".*{domain}$", "$options": "i"}
+        if regex:
+            query["email"] = {"$regex": regex}
+        if only_valid:
+            query["valid"] = True
+        
+        # Find matching contacts
+        matching_contacts = collection.find(query, projection={"name": 1, "email": 1, "valid": 1})
+        
+        # Prepare bulk insert operations
+        bulk_operations = []
+        for contact in matching_contacts:
+            new_contact = {
+                "group_name": new_group,
+                "name": contact.get("name"),
+                "email": contact["email"],
+                "valid": contact["valid"],
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }
             
-            # Add REGEXP support
-            def regexp(expr, item):
-                if item is None:
-                    return False
-                try:
-                    return bool(re.search(expr, item))
-                except Exception:
-                    return False
-                    
-            conn.create_function("REGEXP", 2, regexp)
+            bulk_operations.append(
+                UpdateOne(
+                    {"email": contact["email"], "group_name": new_group},
+                    {"$setOnInsert": new_contact},
+                    upsert=True
+                )
+            )
+        
+        # Execute bulk operations
+        if bulk_operations:
+            result = collection.bulk_write(bulk_operations, ordered=False)
+            created_count = result.upserted_count
             
-            # Build query dynamically
-            query = "SELECT name, email, valid FROM contacts WHERE 1=1"
-            params = []
-            
-            if source_group:
-                query += " AND group_name = ?"
-                params.append(source_group)
-                
-            if domain:
-                query += " AND email LIKE ?"
-                params.append(f"%{domain}")
-                
-            if regex:
-                query += " AND email REGEXP ?"
-                params.append(regex)
-                
-            if only_valid:
-                query += " AND valid = 1"
-            
-            cur.execute(query, params)
-            rows = cur.fetchall()
-            
-            # Insert filtered contacts
-            for name, email, valid in rows:
-                try:
-                    cur.execute(
-                        """INSERT OR IGNORE INTO contacts 
-                           (group_name, name, email, valid) 
-                           VALUES (?, ?, ?, ?)""",
-                        (new_group, name, email, valid),
-                    )
-                    if cur.rowcount > 0:
-                        created_count += 1
-                except sqlite3.Error as e:
-                    error_messages.append(f"Failed to insert {email}: {str(e)}")
-            
-            conn.commit()
-            
-    except Exception as e:
+    except PyMongoError as e:
         logger.error("Error filtering contacts: %s", e)
         error_messages.append(f"Filtering error: {str(e)}")
     
@@ -468,15 +472,15 @@ def export_group_to_csv(group_name: str, output_file: str) -> str:
         raise ValueError(f"Invalid group name: {group_name}")
         
     try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT name, email, valid FROM contacts WHERE group_name = ? ORDER BY email",
-                (group_name,)
-            )
-            rows = cur.fetchall()
-            
-        if not rows:
+        collection = get_contacts_collection()
+        
+        contacts = collection.find(
+            {"group_name": group_name},
+            projection={"name": 1, "email": 1, "valid": 1}
+        ).sort("email", pymongo.ASCENDING)
+        
+        contacts_list = list(contacts)
+        if not contacts_list:
             raise ValueError(f"No contacts found in group: {group_name}")
         
         # Ensure output directory exists
@@ -485,12 +489,17 @@ def export_group_to_csv(group_name: str, output_file: str) -> str:
         with open(output_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["Name", "Email", "Valid"])
-            writer.writerows(rows)
+            for contact in contacts_list:
+                writer.writerow([
+                    contact.get("name", ""),
+                    contact["email"],
+                    "Yes" if contact.get("valid", False) else "No"
+                ])
             
-        logger.info("Exported %d contacts from %s to %s", len(rows), group_name, output_file)
+        logger.info("Exported %d contacts from %s to %s", len(contacts_list), group_name, output_file)
         return output_file
         
-    except Exception as e:
+    except PyMongoError as e:
         logger.error("Error exporting group %s: %s", group_name, e)
         raise
 
@@ -503,33 +512,36 @@ def health_check() -> Dict[str, Any]:
         "database_accessible": False,
         "total_contacts": 0,
         "total_groups": 0,
-        "timestamp": pd.Timestamp.now().isoformat()
+        "timestamp": datetime.utcnow().isoformat()
     }
     
     try:
         # Test database connection and basic operations
-        with get_db_connection() as conn:
-            health["database_accessible"] = True
-            
-            # Count total contacts
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM contacts")
-            health["total_contacts"] = cur.fetchone()[0] or 0
-            
-            # Count groups
-            cur.execute("SELECT COUNT(DISTINCT group_name) FROM contacts")
-            health["total_groups"] = cur.fetchone()[0] or 0
-            
-            # Check database integrity
-            cur.execute("PRAGMA integrity_check")
-            integrity_result = cur.fetchone()[0]
-            health["database_integrity"] = integrity_result == "ok"
-            
-            if health["database_accessible"] and health["database_integrity"]:
-                health["status"] = "healthy"
-            else:
-                health["status"] = "degraded"
-                health["warning"] = "Database integrity check failed"
+        collection = get_contacts_collection()
+        
+        # Test connection with a simple command
+        collection.database.command('ping')
+        health["database_accessible"] = True
+        
+        # Count total contacts
+        health["total_contacts"] = collection.count_documents({})
+        
+        # Count distinct groups
+        health["total_groups"] = len(collection.distinct("group_name"))
+        
+        # Get database stats
+        db_stats = collection.database.command("dbstats")
+        health["database_stats"] = {
+            "collections": db_stats.get("collections", 0),
+            "objects": db_stats.get("objects", 0),
+            "data_size": db_stats.get("dataSize", 0)
+        }
+        
+        if health["database_accessible"]:
+            health["status"] = "healthy"
+        else:
+            health["status"] = "degraded"
+            health["warning"] = "Database connection issue"
                 
     except Exception as e:
         health["status"] = "error"
