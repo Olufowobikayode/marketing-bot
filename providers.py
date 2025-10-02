@@ -2,20 +2,24 @@
 import os
 import json
 import logging
-import sqlite3
 from typing import Dict, List, Optional, Any
-from datetime import datetime
+from datetime import datetime, timedelta
+from bson import ObjectId
+import pymongo
+from pymongo import MongoClient, UpdateOne
+from pymongo.errors import PyMongoError, DuplicateKeyError
 
 # ========= CONFIG =========
 try:
-    from config import DATA_DIR
+    from config import MONGODB_URI, MONGODB_DB_NAME, DATA_DIR
 except ImportError:
     from dotenv import load_dotenv
     load_dotenv()
+    MONGODB_URI = os.getenv("MONGODB_URI")
+    MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "marketing_bot")
     DATA_DIR = os.getenv("DATA_DIR", "data")
 
 os.makedirs(DATA_DIR, exist_ok=True)
-PROVIDERS_DB = os.path.join(DATA_DIR, "providers.db")
 
 # ========= LOGGING =========
 logger = logging.getLogger("providers")
@@ -25,54 +29,86 @@ if not logger.handlers:
     logger.addHandler(h)
 logger.setLevel(logging.INFO)
 
+# ========= MONGODB CONNECTION MANAGEMENT =========
+class MongoDBManager:
+    _client = None
+    _db = None
+    
+    @classmethod
+    def get_client(cls):
+        if cls._client is None:
+            try:
+                cls._client = MongoClient(
+                    MONGODB_URI,
+                    maxPoolSize=50,
+                    connectTimeoutMS=30000,
+                    socketTimeoutMS=30000,
+                    retryWrites=True
+                )
+                # Test connection
+                cls._client.admin.command('ping')
+                logger.info("MongoDB connection established successfully")
+            except Exception as e:
+                logger.error("Failed to connect to MongoDB: %s", e)
+                raise
+        return cls._client
+    
+    @classmethod
+    def get_db(cls):
+        if cls._db is None:
+            client = cls.get_client()
+            cls._db = client[MONGODB_DB_NAME]
+        return cls._db
+    
+    @classmethod
+    def get_providers_collection(cls):
+        db = cls.get_db()
+        return db.providers
+    
+    @classmethod
+    def get_provider_stats_collection(cls):
+        db = cls.get_db()
+        return db.provider_stats
+    
+    @classmethod
+    def close_connection(cls):
+        if cls._client:
+            cls._client.close()
+            cls._client = None
+            cls._db = None
+            logger.info("MongoDB connection closed")
+
+def get_providers_collection():
+    """Get the providers collection with error handling."""
+    return MongoDBManager.get_providers_collection()
+
+def get_provider_stats_collection():
+    """Get the provider_stats collection with error handling."""
+    return MongoDBManager.get_provider_stats_collection()
+
 # ========= DATABASE SETUP =========
 def init_db():
-    """Initialize providers database."""
-    conn = sqlite3.connect(PROVIDERS_DB)
-    cur = conn.cursor()
-    
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS email_providers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE NOT NULL,
-        provider_type TEXT NOT NULL,
-        credentials TEXT NOT NULL,
-        priority INTEGER DEFAULT 99,
-        enabled BOOLEAN DEFAULT 1,
-        daily_limit INTEGER DEFAULT 1000,
-        used_today INTEGER DEFAULT 0,
-        success_count INTEGER DEFAULT 0,
-        failure_count INTEGER DEFAULT 0,
-        last_used TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS provider_stats (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        provider_id INTEGER,
-        date TEXT NOT NULL,
-        sent_count INTEGER DEFAULT 0,
-        failed_count INTEGER DEFAULT 0,
-        FOREIGN KEY (provider_id) REFERENCES email_providers (id)
-    )
-    """)
-    
-    # Create trigger for updated_at
-    cur.execute("""
-    CREATE TRIGGER IF NOT EXISTS update_provider_timestamp 
-    AFTER UPDATE ON email_providers
-    FOR EACH ROW
-    BEGIN
-        UPDATE email_providers SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-    END
-    """)
-    
-    conn.commit()
-    conn.close()
-    logger.info("Providers database initialized")
+    """Initialize MongoDB indexes for providers with robust error handling."""
+    try:
+        providers_collection = get_providers_collection()
+        stats_collection = get_provider_stats_collection()
+        
+        # Create indexes for providers
+        providers_collection.create_index([("name", pymongo.ASCENDING)], unique=True, name="idx_providers_name")
+        providers_collection.create_index([("enabled", pymongo.ASCENDING)], name="idx_providers_enabled")
+        providers_collection.create_index([("priority", pymongo.ASCENDING)], name="idx_providers_priority")
+        providers_collection.create_index([("provider_type", pymongo.ASCENDING)], name="idx_providers_type")
+        
+        # Create indexes for provider_stats
+        stats_collection.create_index([("provider_name", pymongo.ASCENDING), ("date", pymongo.ASCENDING)], 
+                                    unique=True, name="idx_stats_provider_date")
+        stats_collection.create_index([("date", pymongo.ASCENDING)], name="idx_stats_date")
+        
+        logger.info("MongoDB indexes initialized successfully")
+        
+    except Exception as e:
+        logger.error("Failed to initialize MongoDB indexes: %s", e)
+        raise
 
 # ========= PROVIDER MANAGEMENT =========
 def add_provider(
@@ -96,28 +132,36 @@ def add_provider(
         Success status
     """
     try:
-        conn = sqlite3.connect(PROVIDERS_DB)
-        cur = conn.cursor()
+        collection = get_providers_collection()
         
-        cur.execute(
-            """
-            INSERT INTO email_providers 
-            (name, provider_type, credentials, priority, daily_limit)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (name, provider_type, json.dumps(credentials), priority, daily_limit)
-        )
+        provider_data = {
+            "name": name,
+            "provider_type": provider_type,
+            "credentials": credentials,
+            "priority": priority,
+            "enabled": True,
+            "daily_limit": daily_limit,
+            "used_today": 0,
+            "success_count": 0,
+            "failure_count": 0,
+            "last_used": None,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
         
-        conn.commit()
-        conn.close()
+        result = collection.insert_one(provider_data)
         
-        logger.info("Added provider: %s (%s)", name, provider_type)
-        return True
+        if result.inserted_id:
+            logger.info("Added provider: %s (%s)", name, provider_type)
+            return True
+        else:
+            logger.error("Failed to add provider: %s", name)
+            return False
         
-    except sqlite3.IntegrityError:
+    except DuplicateKeyError:
         logger.error("Provider with name '%s' already exists", name)
         return False
-    except Exception as e:
+    except PyMongoError as e:
         logger.error("Failed to add provider %s: %s", name, e)
         return False
 
@@ -130,66 +174,59 @@ def update_provider(
 ) -> bool:
     """Update provider configuration."""
     try:
-        conn = sqlite3.connect(PROVIDERS_DB)
-        cur = conn.cursor()
+        collection = get_providers_collection()
         
-        updates = []
-        params = []
+        update_data = {"updated_at": datetime.utcnow()}
         
         if credentials is not None:
-            updates.append("credentials = ?")
-            params.append(json.dumps(credentials))
+            update_data["credentials"] = credentials
         
         if priority is not None:
-            updates.append("priority = ?")
-            params.append(priority)
+            update_data["priority"] = priority
             
         if enabled is not None:
-            updates.append("enabled = ?")
-            params.append(enabled)
+            update_data["enabled"] = enabled
             
         if daily_limit is not None:
-            updates.append("daily_limit = ?")
-            params.append(daily_limit)
+            update_data["daily_limit"] = daily_limit
             
-        if not updates:
+        if len(update_data) == 1:  # Only updated_at was set
             return False
             
-        params.append(name)
+        result = collection.update_one(
+            {"name": name},
+            {"$set": update_data}
+        )
         
-        query = f"UPDATE email_providers SET {', '.join(updates)} WHERE name = ?"
-        cur.execute(query, params)
+        if result.modified_count > 0:
+            logger.info("Updated provider: %s", name)
+            return True
+        else:
+            logger.warning("Provider %s not found for update", name)
+            return False
         
-        conn.commit()
-        conn.close()
-        
-        logger.info("Updated provider: %s", name)
-        return cur.rowcount > 0
-        
-    except Exception as e:
+    except PyMongoError as e:
         logger.error("Failed to update provider %s: %s", name, e)
         return False
 
 def remove_provider(name: str) -> bool:
     """Remove a provider."""
     try:
-        conn = sqlite3.connect(PROVIDERS_DB)
-        cur = conn.cursor()
+        providers_collection = get_providers_collection()
+        stats_collection = get_provider_stats_collection()
         
-        cur.execute("DELETE FROM email_providers WHERE name = ?", (name,))
-        success = cur.rowcount > 0
+        # Remove provider and its stats
+        provider_result = providers_collection.delete_one({"name": name})
+        stats_collection.delete_many({"provider_name": name})
         
-        conn.commit()
-        conn.close()
-        
-        if success:
+        if provider_result.deleted_count > 0:
             logger.info("Removed provider: %s", name)
+            return True
         else:
             logger.warning("Provider not found: %s", name)
-            
-        return success
+            return False
         
-    except Exception as e:
+    except PyMongoError as e:
         logger.error("Failed to remove provider %s: %s", name, e)
         return False
 
@@ -204,134 +241,122 @@ def disable_provider(name: str) -> bool:
 def get_provider(name: str) -> Optional[Dict[str, Any]]:
     """Get provider details."""
     try:
-        conn = sqlite3.connect(PROVIDERS_DB)
-        cur = conn.cursor()
+        collection = get_providers_collection()
         
-        cur.execute("SELECT * FROM email_providers WHERE name = ?", (name,))
-        row = cur.fetchone()
-        conn.close()
+        provider = collection.find_one({"name": name})
         
-        if not row:
-            return None
+        if provider:
+            # Convert ObjectId to string and calculate success rate
+            provider_dict = dict(provider)
+            provider_dict["_id"] = str(provider_dict["_id"])
             
-        return {
-            "id": row[0],
-            "name": row[1],
-            "type": row[2],
-            "credentials": json.loads(row[3]),
-            "priority": row[4],
-            "enabled": bool(row[5]),
-            "daily_limit": row[6],
-            "used_today": row[7],
-            "success_count": row[8],
-            "failure_count": row[9],
-            "last_used": row[10],
-            "created_at": row[11],
-            "updated_at": row[12]
-        }
+            total_attempts = provider_dict["success_count"] + provider_dict["failure_count"]
+            provider_dict["success_rate"] = (
+                provider_dict["success_count"] / total_attempts * 100 
+                if total_attempts > 0 else 0
+            )
+            
+            return provider_dict
+        else:
+            return None
         
-    except Exception as e:
+    except PyMongoError as e:
         logger.error("Failed to get provider %s: %s", name, e)
         return None
 
 def list_providers(enabled_only: bool = False) -> List[Dict[str, Any]]:
     """List all providers."""
     try:
-        conn = sqlite3.connect(PROVIDERS_DB)
-        cur = conn.cursor()
+        collection = get_providers_collection()
         
+        query = {}
         if enabled_only:
-            cur.execute("SELECT * FROM email_providers WHERE enabled = 1 ORDER BY priority, name")
-        else:
-            cur.execute("SELECT * FROM email_providers ORDER BY priority, name")
+            query["enabled"] = True
             
-        rows = cur.fetchall()
-        conn.close()
+        providers_cursor = collection.find(query).sort([("priority", pymongo.ASCENDING), ("name", pymongo.ASCENDING)])
         
         providers = []
-        for row in rows:
-            providers.append({
-                "id": row[0],
-                "name": row[1],
-                "type": row[2],
-                "credentials": json.loads(row[3]),
-                "priority": row[4],
-                "enabled": bool(row[5]),
-                "daily_limit": row[6],
-                "used_today": row[7],
-                "success_count": row[8],
-                "failure_count": row[9],
-                "last_used": row[10],
-                "created_at": row[11],
-                "updated_at": row[12],
-                "success_rate": row[8] / (row[8] + row[9]) if (row[8] + row[9]) > 0 else 0
-            })
+        for provider in providers_cursor:
+            provider_dict = dict(provider)
+            provider_dict["_id"] = str(provider_dict["_id"])
+            
+            # Calculate success rate
+            total_attempts = provider_dict["success_count"] + provider_dict["failure_count"]
+            provider_dict["success_rate"] = (
+                provider_dict["success_count"] / total_attempts * 100 
+                if total_attempts > 0 else 0
+            )
+            
+            providers.append(provider_dict)
             
         return providers
         
-    except Exception as e:
+    except PyMongoError as e:
         logger.error("Failed to list providers: %s", e)
         return []
 
 def update_provider_stats(provider_name: str, success: bool):
     """Update provider usage statistics."""
     try:
-        conn = sqlite3.connect(PROVIDERS_DB)
-        cur = conn.cursor()
+        providers_collection = get_providers_collection()
+        stats_collection = get_provider_stats_collection()
         
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        now = datetime.utcnow()
         
-        # Update daily usage
+        # Update provider main stats
+        update_data = {
+            "last_used": now,
+            "updated_at": now
+        }
+        
         if success:
-            cur.execute(
-                "UPDATE email_providers SET success_count = success_count + 1, used_today = used_today + 1, last_used = CURRENT_TIMESTAMP WHERE name = ?",
-                (provider_name,)
-            )
+            update_data["$inc"] = {
+                "success_count": 1,
+                "used_today": 1
+            }
         else:
-            cur.execute(
-                "UPDATE email_providers SET failure_count = failure_count + 1, last_used = CURRENT_TIMESTAMP WHERE name = ?",
-                (provider_name,)
-            )
+            update_data["$inc"] = {
+                "failure_count": 1
+            }
         
-        # Update daily stats
-        cur.execute(
-            "SELECT id FROM provider_stats WHERE provider_id = (SELECT id FROM email_providers WHERE name = ?) AND date = ?",
-            (provider_name, today)
+        providers_collection.update_one(
+            {"name": provider_name},
+            update_data
         )
         
-        if cur.fetchone():
-            if success:
-                cur.execute(
-                    "UPDATE provider_stats SET sent_count = sent_count + 1 WHERE provider_id = (SELECT id FROM email_providers WHERE name = ?) AND date = ?",
-                    (provider_name, today)
-                )
-            else:
-                cur.execute(
-                    "UPDATE provider_stats SET failed_count = failed_count + 1 WHERE provider_id = (SELECT id FROM email_providers WHERE name = ?) AND date = ?",
-                    (provider_name, today)
-                )
+        # Update daily stats
+        stats_update = {
+            "$setOnInsert": {
+                "provider_name": provider_name,
+                "date": today
+            }
+        }
+        
+        if success:
+            stats_update["$inc"] = {"sent_count": 1}
         else:
-            cur.execute(
-                "INSERT INTO provider_stats (provider_id, date, sent_count, failed_count) VALUES ((SELECT id FROM email_providers WHERE name = ?), ?, ?, ?)",
-                (provider_name, today, 1 if success else 0, 0 if success else 1)
-            )
+            stats_update["$inc"] = {"failed_count": 1}
         
-        conn.commit()
-        conn.close()
+        stats_collection.update_one(
+            {"provider_name": provider_name, "date": today},
+            stats_update,
+            upsert=True
+        )
         
-    except Exception as e:
+    except PyMongoError as e:
         logger.error("Failed to update stats for %s: %s", provider_name, e)
 
 def reset_daily_limits():
     """Reset daily usage counters (call this daily via cron)."""
     try:
-        conn = sqlite3.connect(PROVIDERS_DB)
-        cur = conn.cursor()
-        cur.execute("UPDATE email_providers SET used_today = 0")
-        conn.commit()
-        conn.close()
+        collection = get_providers_collection()
+        collection.update_many(
+            {},
+            {"$set": {"used_today": 0, "updated_at": datetime.utcnow()}}
+        )
         logger.info("Daily limits reset")
-    except Exception as e:
+    except PyMongoError as e:
         logger.error("Failed to reset daily limits: %s", e)
 
 def get_provider_stats(provider_name: str) -> Dict[str, Any]:
@@ -341,34 +366,32 @@ def get_provider_stats(provider_name: str) -> Dict[str, Any]:
         return {"error": "Provider not found"}
     
     try:
-        conn = sqlite3.connect(PROVIDERS_DB)
-        cur = conn.cursor()
+        stats_collection = get_provider_stats_collection()
         
         # Get 30-day history
-        cur.execute("""
-            SELECT date, sent_count, failed_count 
-            FROM provider_stats 
-            WHERE provider_id = ? 
-            ORDER BY date DESC 
-            LIMIT 30
-        """, (provider["id"],))
+        thirty_days_ago = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+        
+        history_cursor = stats_collection.find(
+            {
+                "provider_name": provider_name,
+                "date": {"$gte": thirty_days_ago}
+            }
+        ).sort("date", pymongo.DESCENDING).limit(30)
         
         history = []
-        for row in cur.fetchall():
+        for stat in history_cursor:
             history.append({
-                "date": row[0],
-                "sent": row[1],
-                "failed": row[2]
+                "date": stat["date"],
+                "sent": stat.get("sent_count", 0),
+                "failed": stat.get("failed_count", 0)
             })
-        
-        conn.close()
         
         total_attempts = provider["success_count"] + provider["failure_count"]
         success_rate = (provider["success_count"] / total_attempts * 100) if total_attempts > 0 else 0
         
         return {
             "name": provider["name"],
-            "type": provider["type"],
+            "type": provider["provider_type"],
             "enabled": provider["enabled"],
             "priority": provider["priority"],
             "daily_usage": f"{provider['used_today']}/{provider['daily_limit']}",
@@ -379,7 +402,7 @@ def get_provider_stats(provider_name: str) -> Dict[str, Any]:
             "history": history
         }
         
-    except Exception as e:
+    except PyMongoError as e:
         logger.error("Failed to get stats for %s: %s", provider_name, e)
         return {"error": str(e)}
 
@@ -424,6 +447,52 @@ def get_supported_providers() -> List[str]:
 def get_provider_template(provider_type: str) -> Optional[Dict[str, Any]]:
     """Get template for a provider type."""
     return PROVIDER_TEMPLATES.get(provider_type)
+
+# ========= HEALTH CHECK =========
+def health_check() -> Dict[str, Any]:
+    """Perform health check on providers module."""
+    health = {
+        "module": "providers",
+        "status": "unknown",
+        "database_accessible": False,
+        "total_providers": 0,
+        "enabled_providers": 0,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    
+    try:
+        # Test database connection and basic operations
+        providers_collection = get_providers_collection()
+        
+        # Test connection with a simple command
+        providers_collection.database.command('ping')
+        health["database_accessible"] = True
+        
+        # Count providers
+        health["total_providers"] = providers_collection.count_documents({})
+        health["enabled_providers"] = providers_collection.count_documents({"enabled": True})
+        
+        # Get provider statistics
+        providers = list_providers()
+        total_success = sum(p["success_count"] for p in providers)
+        total_failures = sum(p["failure_count"] for p in providers)
+        total_attempts = total_success + total_failures
+        
+        health["total_emails_sent"] = total_success
+        health["total_emails_failed"] = total_failures
+        health["success_rate"] = (total_success / total_attempts * 100) if total_attempts > 0 else 0
+        
+        if health["database_accessible"]:
+            health["status"] = "healthy"
+        else:
+            health["status"] = "degraded"
+            health["warning"] = "Database connection issue"
+                
+    except Exception as e:
+        health["status"] = "error"
+        health["error"] = str(e)
+    
+    return health
 
 # ========= INITIALIZATION =========
 def initialize_default_providers():
@@ -472,3 +541,24 @@ def initialize_default_providers():
 # Initialize on import
 init_db()
 initialize_default_providers()
+
+# ========= CLI TEST =========
+if __name__ == "__main__":
+    print("📧 Providers Module Production Test")
+    print("=" * 50)
+    
+    # Health check
+    health = health_check()
+    print(f"Health Status: {health['status']}")
+    print(f"Database Accessible: {health['database_accessible']}")
+    print(f"Total Providers: {health['total_providers']}")
+    print(f"Enabled Providers: {health['enabled_providers']}")
+    print(f"Success Rate: {health['success_rate']:.1f}%")
+    
+    if health["status"] == "healthy":
+        # List providers
+        providers = list_providers()
+        print(f"\n📋 Email Providers ({len(providers)}):")
+        for provider in providers:
+            status = "🟢" if provider["enabled"] else "🔴"
+            print(f"  {status} {provider['name']} ({provider['provider_type']}) - Priority: {provider['priority']}")
