@@ -856,6 +856,16 @@ def get_default_mailer(
         )
     return _DEFAULT_MAILER
 
+# ========= PROVIDER REFRESH =========
+def refresh_mailer_providers():
+    """
+    Refresh the mailer's provider list to pick up newly added providers.
+    This is useful when adding providers at runtime.
+    """
+    global _DEFAULT_MAILER
+    _DEFAULT_MAILER = None
+    logger.info("Mailer providers refreshed")
+
 # ========= TEST AND DEMONSTRATION =========
 if __name__ == "__main__":
     print("🚀 Mailer Module Production Test")
