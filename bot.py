@@ -1,13 +1,14 @@
 import os
 import asyncio
 import logging
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Path
 import uvicorn
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, types
 from aiogram.client.bot import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Update
+from aiogram.filters import Command
 
 # -------------------- HARD-CODED BOT --------------------
 BOT_TOKEN = "8301662693:AAG22_FCPQzbliZKs75OvOS-bJTnhSJ499s"
@@ -43,16 +44,38 @@ fast_app = FastAPI()
 fast_app.mount("/", unsubscribe_app)
 
 # -------------------- WEBHOOK ENDPOINT --------------------
-@fast_app.post(f"/webhook/{BOT_TOKEN}")
-async def telegram_webhook(request: Request):
+@fast_app.post("/webhook/{token}")
+async def telegram_webhook(token: str = Path(...), request: Request = None):
     update_data = await request.json()
-    logging.info(f"Received update: {update_data}")
+    logging.info(f"Received update for token: {token}: {update_data}")
     try:
         update = Update(**update_data)
         await dp.feed_update(bot, update)
     except Exception as e:
         logging.error(f"Webhook update error: {e}")
     return {"ok": True}
+
+# -------------------- /start COMMAND --------------------
+@dp.message(Command("start"))
+async def start_command(message: types.Message):
+    text = (
+        "👋 Welcome to Pulse Mailer Bot!\n\n"
+        "Available commands:\n"
+        "/start - Show this message\n"
+        "/create_campaign - Create a new campaign\n"
+        "/list_campaigns - List all campaigns\n"
+        "/delete_campaign <id> - Delete a campaign\n"
+        "/generate_campaign_ai - AI-generated campaign\n"
+        "/list_contacts - List all contacts\n"
+        "/add_contact - Add a new contact\n"
+        "/import_contacts - Import contacts via file\n"
+        "/list_providers - Show providers\n"
+        "/add_provider - Add a provider\n"
+        "/send_campaign - Send a campaign\n"
+        "/templates - Show templates\n"
+        "/upload_template - Upload a new template\n"
+    )
+    await message.answer(text)
 
 # -------------------- STARTUP & SHUTDOWN --------------------
 async def on_startup():
