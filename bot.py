@@ -1,23 +1,23 @@
-import os
 import asyncio
-from aiogram import Bot, Dispatcher
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.client.bot import DefaultBotProperties
-from fastapi import FastAPI
-import uvicorn
 import logging
+from fastapi import FastAPI, Request
+import uvicorn
 
-# -------------------- ENV --------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-PORT = int(os.getenv("PORT", 8000))
+from aiogram import Bot, Dispatcher
+from aiogram.client.bot import DefaultBotProperties
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Update
 
-# -------------------- TELEGRAM BOT --------------------
+# -------------------- HARD-CODED --------------------
+BOT_TOKEN = "8301662693:AAG22_FCPQzbliZKs75OvOS-bJTnhSJ499s"
+WEBHOOK_URL = f"https://marketing-bot-95x3.onrender.com/webhook/{BOT_TOKEN}"
+PORT = 8000  # Render will assign actual port automatically
+
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(
-        parse_mode="HTML",            # ensures HTML parsing
-        link_preview_is_disabled=True # prevents KeyError 'link_preview'
+        parse_mode="HTML",
+        link_preview_is_disabled=True
     )
 )
 dp = Dispatcher(storage=MemoryStorage())
@@ -40,27 +40,40 @@ dp.include_router(template_router)
 fast_app = FastAPI()
 fast_app.mount("/", unsubscribe_app)
 
-# -------------------- Main Async Runner --------------------
+# Webhook endpoint for Telegram
+@fast_app.post(f"/webhook/{BOT_TOKEN}")
+async def telegram_webhook(request: Request):
+    try:
+        update_data = await request.json()
+        update = Update(**update_data)
+        await dp.feed_update(bot, update)
+    except Exception as e:
+        logging.error(f"Webhook update error: {e}")
+    return {"ok": True}
+
+# -------------------- Startup / Shutdown --------------------
+async def on_startup():
+    logging.info("Starting bot with webhook...")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(WEBHOOK_URL)
+    logging.info(f"Webhook set to {WEBHOOK_URL}")
+
+async def on_shutdown():
+    logging.info("Shutting down...")
+    await bot.delete_webhook()
+    await bot.session.close()
+
+# -------------------- Main Runner --------------------
 async def main():
     logging.basicConfig(level=logging.INFO)
+    config = uvicorn.Config(fast_app, host="0.0.0.0", port=PORT, log_level="info")
+    server = uvicorn.Server(config)
 
-    async def start_bot():
-        try:
-            async with AiohttpSession():  # ensures proper session usage
-                await dp.start_polling(bot)
-        except Exception as e:
-            logging.error(f"Bot polling error: {e}")
-
-    async def start_fastapi():
-        config = uvicorn.Config(fast_app, host="0.0.0.0", port=PORT, log_level="info")
-        server = uvicorn.Server(config)
+    await on_startup()
+    try:
         await server.serve()
-
-    # Run both concurrently
-    await asyncio.gather(
-        start_bot(),
-        start_fastapi()
-    )
+    finally:
+        await on_shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
