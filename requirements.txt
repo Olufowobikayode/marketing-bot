@@ -1,18 +1,37 @@
-pip>=25.2
-setuptools>=75
-wheel
-ninja
-cmake
-numpy==1.26.2
-pandas==2.0.3
-python-dotenv==1.0.0
-requests==2.31.0
+# Telegram & Bot
+aiogram==3.1.0
+
+# FastAPI & Web
+fastapi==0.109.1
+uvicorn==0.24.0
+
+# Database
+pymongo==4.4.0
+
+# HTTP Requests / Async API
+httpx==0.24.1
+requests==2.32.0
+urllib3==2.0.4
+
+# Email
+email-validator==2.0.0
+aiosmtplib==1.1.6
+
+# Data handling
+pandas==2.1.1
 openpyxl==3.1.2
-email-validator==2.1.0
-python-telegram-bot==20.7
-google-generativeai==0.3.2
-aiohttp==3.9.1
-pydantic==1.10.13
-pymongo==4.6.0
-grpcio==1.60.0
-grpcio-tools==1.60.0
+
+# Environment variables
+python-dotenv==1.0.0
+
+# AI Service
+google-generativeai==0.3.0
+
+# Optional: MJML templates
+requests-toolbelt==0.10.1
+
+# Scheduler (if needed)
+APScheduler==3.10.1
+
+# Utilities
+gunicorn==21.2.0
