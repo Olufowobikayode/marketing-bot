@@ -1,15 +1,11 @@
 # db.py
-import os
-from pymongo import MongoClient, errors
-from functools import lru_cache
 import logging
+from functools import lru_cache
+from pymongo import MongoClient, errors
 
-# -------------------- ENV --------------------
-MONGO_URI = os.getenv(
-    "MONGODB_URI",
-    "mongodb+srv://pulsemailerbot:swagame4life@pulsemailerbot.5p3xa5j.mongodb.net/?retryWrites=true&w=majority&appName=PulseMailerBot"
-)
-MONGO_DB_NAME = os.getenv("MONGODB_DB_NAME", "PulseMailerBot")
+# -------------------- HARD-CODED MONGO --------------------
+MONGO_URI = "mongodb+srv://pulsemailerbot:swagame4life@pulsemailerbot.5p3xa5j.mongodb.net/?retryWrites=true&w=majority&appName=PulseMailerBot"
+MONGO_DB_NAME = "PulseMailerBot"
 
 # -------------------- Logging --------------------
 logging.basicConfig(level=logging.INFO)
@@ -36,13 +32,13 @@ def get_db():
 def get_collection(name: str):
     """
     Returns a MongoDB collection instance.
-    Usage:
-        templates_col = get_collection("templates")
+    Example:
+        campaigns_col = get_collection("campaigns")
     """
     db = get_db()
     return db[name]
 
-# -------------------- Optional Helpers --------------------
+# -------------------- Safe DB Helpers --------------------
 def safe_insert(collection_name: str, doc: dict):
     try:
         col = get_collection(collection_name)
