@@ -1,37 +1,37 @@
 # Telegram & Bot
-aiogram==3.1.0
+aiogram
 
 # FastAPI & Web
-fastapi==0.109.1
-uvicorn==0.24.0
+fastapi
+uvicorn
 
 # Database
-pymongo==4.4.0
+pymongo
 
 # HTTP Requests / Async API
-httpx==0.24.1
-requests==2.32.0
-urllib3==2.0.4
+httpx
+requests
+urllib3
 
 # Email
-email-validator==2.0.0
-aiosmtplib==1.1.6
+email-validator
+aiosmtplib
 
 # Data handling
-pandas==2.1.1
-openpyxl==3.1.2
+pandas
+openpyxl
 
 # Environment variables
-python-dotenv==1.0.0
+python-dotenv
 
 # AI Service
-google-generativeai==0.3.0
+google-generativeai
 
 # Optional: MJML templates
-requests-toolbelt==0.10.1
+requests-toolbelt
 
 # Scheduler (if needed)
-APScheduler==3.10.1
+APScheduler
 
 # Utilities
-gunicorn==21.2.0
+gunicorn
