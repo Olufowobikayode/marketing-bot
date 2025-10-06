@@ -1,16 +1,14 @@
+# providers/manager.py
 from aiogram import Router, types, F
 from aiogram.filters import Command
-from pymongo import MongoClient
-from bson import ObjectId
-import os
 import json
-
-MONGO_URI = os.getenv("MONGODB_URI")
-DB_NAME = os.getenv("MONGODB_DB_NAME", "PulseMailerBot")
-client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
+from bson import ObjectId
+from db import get_collection, safe_insert, safe_find, safe_delete
 
 router = Router()
+
+# Collections
+providers_col = get_collection("providers")
 
 # --- Add provider ---
 @router.message(Command("add_provider"))
@@ -31,19 +29,26 @@ async def save_provider(message: types.Message):
         if not all(k in data for k in required_keys):
             await message.answer("Invalid JSON. Must include 'name', 'type', 'config'.")
             return
+
         data["type"] = data["type"].upper()
-        db.providers.insert_one(data)
-        await message.answer(f"Provider '{data['name']}' added successfully.")
+        inserted_id = safe_insert("providers", data)
+        if inserted_id:
+            await message.answer(f"✅ Provider '{data['name']}' added successfully.")
+        else:
+            await message.answer("❌ Failed to add provider. Please try again.")
+    except json.JSONDecodeError:
+        await message.answer("❌ Invalid JSON format. Please send valid JSON.")
     except Exception as e:
         await message.answer(f"Error adding provider: {e}")
 
 # --- List providers ---
 @router.message(Command("list_providers"))
 async def list_providers(message: types.Message):
-    providers = list(db.providers.find({}))
+    providers = safe_find("providers")
     if not providers:
         await message.answer("No providers found.")
         return
+
     text = "Providers:\n"
     for p in providers:
         text += f"{p['_id']} | {p['name']} | {p['type']}\n"
@@ -53,11 +58,16 @@ async def list_providers(message: types.Message):
 @router.message(Command("remove_provider"))
 async def remove_provider(message: types.Message):
     try:
-        provider_id = message.text.split(" ", 1)[1]
-        result = db.providers.delete_one({"_id": ObjectId(provider_id)})
-        if result.deleted_count:
-            await message.answer("Provider removed successfully.")
+        parts = message.text.split(" ", 1)
+        if len(parts) != 2:
+            await message.answer("Usage: /remove_provider <provider_id>")
+            return
+
+        provider_id = parts[1]
+        result = safe_delete("providers", {"_id": ObjectId(provider_id)})
+        if result and result.deleted_count > 0:
+            await message.answer("✅ Provider removed successfully.")
         else:
-            await message.answer("Provider not found.")
+            await message.answer("❌ Provider not found.")
     except Exception as e:
         await message.answer(f"Error removing provider: {e}")
