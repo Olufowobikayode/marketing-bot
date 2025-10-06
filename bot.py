@@ -1,3 +1,4 @@
+import os
 import asyncio
 import logging
 from fastapi import FastAPI, Request
@@ -8,11 +9,12 @@ from aiogram.client.bot import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Update
 
-# -------------------- HARD-CODED --------------------
+# -------------------- HARD-CODED BOT --------------------
 BOT_TOKEN = "8301662693:AAG22_FCPQzbliZKs75OvOS-bJTnhSJ499s"
+PORT = int(os.getenv("PORT", 8000))
 WEBHOOK_URL = f"https://marketing-bot-95x3.onrender.com/webhook/{BOT_TOKEN}"
-PORT = 8000  # Render will assign actual port automatically
 
+# -------------------- BOT & DISPATCHER --------------------
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(
@@ -22,7 +24,7 @@ bot = Bot(
 )
 dp = Dispatcher(storage=MemoryStorage())
 
-# -------------------- Import Routers --------------------
+# -------------------- IMPORT ROUTERS --------------------
 from modules.contacts import router as contacts_router
 from modules.campaigns import router as campaigns_router
 from modules.providers.manager import router as provider_router
@@ -36,22 +38,23 @@ dp.include_router(provider_router)
 dp.include_router(send_router)
 dp.include_router(template_router)
 
-# -------------------- FASTAPI --------------------
+# -------------------- FASTAPI APP --------------------
 fast_app = FastAPI()
 fast_app.mount("/", unsubscribe_app)
 
-# Webhook endpoint for Telegram
+# -------------------- WEBHOOK ENDPOINT --------------------
 @fast_app.post(f"/webhook/{BOT_TOKEN}")
 async def telegram_webhook(request: Request):
+    update_data = await request.json()
+    logging.info(f"Received update: {update_data}")
     try:
-        update_data = await request.json()
         update = Update(**update_data)
         await dp.feed_update(bot, update)
     except Exception as e:
         logging.error(f"Webhook update error: {e}")
     return {"ok": True}
 
-# -------------------- Startup / Shutdown --------------------
+# -------------------- STARTUP & SHUTDOWN --------------------
 async def on_startup():
     logging.info("Starting bot with webhook...")
     await bot.delete_webhook(drop_pending_updates=True)
@@ -63,13 +66,13 @@ async def on_shutdown():
     await bot.delete_webhook()
     await bot.session.close()
 
-# -------------------- Main Runner --------------------
+# -------------------- MAIN RUNNER --------------------
 async def main():
     logging.basicConfig(level=logging.INFO)
+    await on_startup()
+
     config = uvicorn.Config(fast_app, host="0.0.0.0", port=PORT, log_level="info")
     server = uvicorn.Server(config)
-
-    await on_startup()
     try:
         await server.serve()
     finally:
