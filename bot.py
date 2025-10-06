@@ -5,13 +5,18 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.fsm.storage.memory import MemoryStorage
 from fastapi import FastAPI
 import uvicorn
+import logging
 
 # -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 8000))
 
 # -------------------- TELEGRAM BOT --------------------
-bot = Bot(token=BOT_TOKEN, default={"parse_mode": "HTML"})  # fixed import issue
+bot = Bot(
+    token=BOT_TOKEN,
+    parse_mode="HTML",           # ensures HTML parsing
+    disable_web_page_preview=True  # prevents KeyError 'link_preview'
+)
 dp = Dispatcher(storage=MemoryStorage())
 
 # -------------------- Import Routers --------------------
@@ -34,16 +39,11 @@ fast_app.mount("/", unsubscribe_app)
 
 # -------------------- Main Async Runner --------------------
 async def main():
-    # Run Aiogram bot
-    from aiogram import F
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    import logging
-
     logging.basicConfig(level=logging.INFO)
 
     async def start_bot():
         try:
-            async with AiohttpSession():  # ensure proper session usage
+            async with AiohttpSession():  # ensures proper session usage
                 await dp.start_polling(bot)
         except Exception as e:
             logging.error(f"Bot polling error: {e}")
