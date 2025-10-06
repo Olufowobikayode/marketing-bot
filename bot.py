@@ -1,6 +1,8 @@
 import os
 import asyncio
 from aiogram import Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.types import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from fastapi import FastAPI
 import uvicorn
@@ -10,7 +12,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 8000))
 
 # -------------------- TELEGRAM BOT --------------------
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 
 # -------------------- Import Routers --------------------
@@ -42,7 +44,8 @@ async def main():
 
     async def start_bot():
         try:
-            await dp.start_polling(bot)
+            async with AiohttpSession():  # ensure proper session usage
+                await dp.start_polling(bot)
         except Exception as e:
             logging.error(f"Bot polling error: {e}")
 
