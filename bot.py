@@ -3,6 +3,7 @@ import asyncio
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.bot import DefaultBotProperties
 from fastapi import FastAPI
 import uvicorn
 import logging
@@ -14,8 +15,10 @@ PORT = int(os.getenv("PORT", 8000))
 # -------------------- TELEGRAM BOT --------------------
 bot = Bot(
     token=BOT_TOKEN,
-    parse_mode="HTML",           # ensures HTML parsing
-    disable_web_page_preview=True  # prevents KeyError 'link_preview'
+    default=DefaultBotProperties(
+        parse_mode="HTML",            # ensures HTML parsing
+        link_preview_is_disabled=True # prevents KeyError 'link_preview'
+    )
 )
 dp = Dispatcher(storage=MemoryStorage())
 
