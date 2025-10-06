@@ -1,22 +1,22 @@
+# providers/send_engine.py
 from aiogram import Router, types
-from pymongo import MongoClient
 from bson import ObjectId
 import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
-import time
-import httpx
 import asyncio
-
-MONGO_URI = os.getenv("MONGODB_URI")
-DB_NAME = os.getenv("MONGODB_DB_NAME", "PulseMailerBot")
-client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
+import httpx
+from db import get_collection, safe_find, safe_update
 
 router = Router()
 DATA_DIR = os.getenv("DATA_DIR", "data")
+
+# Collections
+campaigns_col = get_collection("campaigns")
+providers_col = get_collection("providers")
+contacts_col = get_collection("contacts")
 
 # ----------------- Helper: Personalize Body -----------------
 def personalize_body(body, contact_id, first_name="", last_name=""):
@@ -57,25 +57,27 @@ async def send_campaign(message: types.Message):
         provider_id = parts[2]
         limit = int(parts[3]) if len(parts) > 3 else None
 
-        campaign = db.campaigns.find_one({"_id": ObjectId(campaign_id)})
-        provider = db.providers.find_one({"_id": ObjectId(provider_id)})
+        campaign = campaigns_col.find_one({"_id": ObjectId(campaign_id)})
+        provider = providers_col.find_one({"_id": ObjectId(provider_id)})
 
         if not campaign:
-            await message.answer("Campaign not found.")
+            await message.answer("❌ Campaign not found.")
             return
         if not provider:
-            await message.answer("Provider not found.")
+            await message.answer("❌ Provider not found.")
             return
 
         # Fetch recipients with advanced filtering
-        recipients = list(db.contacts.find(build_recipient_query(campaign)))
+        recipients = safe_find("contacts", build_recipient_query(campaign))
         if limit:
             recipients = recipients[:limit]
 
         sent_count = 0
 
         for contact in recipients:
-            body = personalize_body(campaign["body"], contact["_id"], contact.get("first_name",""), contact.get("last_name",""))
+            body = personalize_body(
+                campaign["body"], contact["_id"], contact.get("first_name",""), contact.get("last_name","")
+            )
             subject = campaign["subject"]
 
             # ----------------- SMTP Provider -----------------
@@ -118,14 +120,18 @@ async def send_campaign(message: types.Message):
                         "html": body
                     }
                     try:
-                        resp = await client_api.post(api_config["endpoint"], json=payload, headers={"Authorization": f"Bearer {api_config['api_key']}"})
+                        resp = await client_api.post(
+                            api_config["endpoint"],
+                            json=payload,
+                            headers={"Authorization": f"Bearer {api_config['api_key']}"}
+                        )
                         if resp.status_code == 200:
                             sent_count += 1
                     except Exception as e:
                         await message.answer(f"Failed API send to {contact['email']}: {e}")
 
-        await message.answer(f"Campaign '{campaign['subject']}' sent to {sent_count} recipients.")
-        db.campaigns.update_one({"_id": ObjectId(campaign_id)}, {"$set": {"status": "sent"}})
+        await message.answer(f"✅ Campaign '{campaign['subject']}' sent to {sent_count} recipients.")
+        safe_update("campaigns", {"_id": ObjectId(campaign_id)}, {"status": "sent"})
 
     except Exception as e:
         await message.answer(f"Error sending campaign: {e}")
