@@ -2,7 +2,6 @@ import os
 import asyncio
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.types import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from fastapi import FastAPI
 import uvicorn
@@ -12,7 +11,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 8000))
 
 # -------------------- TELEGRAM BOT --------------------
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(token=BOT_TOKEN, default={"parse_mode": "HTML"})  # fixed import issue
 dp = Dispatcher(storage=MemoryStorage())
 
 # -------------------- Import Routers --------------------
