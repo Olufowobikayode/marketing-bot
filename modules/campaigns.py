@@ -1,10 +1,11 @@
 # modules/campaigns.py
 from aiogram import Router, types, F
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 from bson import ObjectId
 import json
 import os
-import time
 
 from db import get_collection  # use centralized DB connection
 
@@ -14,17 +15,26 @@ DATA_DIR = os.getenv("DATA_DIR", "data")
 # Collections
 campaigns_col = get_collection("campaigns")
 
+# -------------------- FSM States --------------------
+class CampaignStates(StatesGroup):
+    awaiting_campaign_json = State()
+
 # ----------------- Create Campaign -----------------
 @router.message(Command("create_campaign"))
-async def create_campaign(message: types.Message):
+async def create_campaign(message: types.Message, state: FSMContext):
     await message.answer(
         "Send campaign JSON:\n"
         '{"subject":"Your subject","body":"Email body with {firstname} and {unsubscribe_link}","group_id":"optional_group_id","attachments":[],"images":[]}'
     )
+    await state.set_state(CampaignStates.awaiting_campaign_json)
 
 # ----------------- Save Campaign -----------------
 @router.message(F.text)
-async def save_campaign(message: types.Message):
+async def save_campaign(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state != CampaignStates.awaiting_campaign_json.state:
+        return  # Ignore messages not related to campaign creation
+
     try:
         if not message.text.strip():
             return  # ignore empty messages
@@ -37,11 +47,13 @@ async def save_campaign(message: types.Message):
 
         data["status"] = "draft"
         campaigns_col.insert_one(data)
-        await message.answer(f"Campaign '{data['subject']}' saved as draft.")
+        await message.answer(f"✅ Campaign '{data['subject']}' saved as draft.")
     except json.JSONDecodeError:
         await message.answer("❌ Invalid JSON format. Please send valid JSON.")
     except Exception as e:
         await message.answer(f"Error creating campaign: {e}")
+    finally:
+        await state.clear()  # Reset state after processing
 
 # ----------------- List Campaigns -----------------
 @router.message(Command("list_campaigns"))
@@ -74,7 +86,7 @@ async def delete_campaign(message: types.Message):
     except Exception as e:
         await message.answer(f"Error deleting campaign: {e}")
 
-# ----------------- AI Generated Campaign (Optional) -----------------
+# ----------------- AI Generated Campaign -----------------
 @router.message(Command("generate_campaign_ai"))
 async def generate_campaign_ai(message: types.Message):
     """
